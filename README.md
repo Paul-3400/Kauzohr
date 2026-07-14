@@ -88,7 +88,7 @@ kauzohr/
 - [BirdNET-Pi Enhanced](https://github.com/zach7036/BirdNET-Pi-Enhanced-Version)
 - [BirdNET Team](https://github.com/birdnet-team)
 - [Synature AI](https://synature.ai/de/)
-
+- https://github.com/mcguirepr89/BirdNET-Pi/wiki/BirdNET-Pi:-some-theory-on-classification-&-some-practical-hints
 ---
 
 ## 📜 Lizenz
