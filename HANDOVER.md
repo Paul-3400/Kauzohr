@@ -1,239 +1,329 @@
-# 🦉 BirdNET-Pi Enhanced – Handover & Betriebsanleitung
+# HANDOVER.md – BirdNET-Pi Station "Kauzohr"
 
-## Projekt: Kauzohr – Vogelstimmen-Erkennung auf Raspberry Pi 4B
+## Sitzung 15. Juli 2026
 
-*Built as a "brain gym" project – keeping the mind sharp through electronics and code. 🧠💪*  
-*by Paul and Claude, Anthropic 2026*
-
----
-
-## 📋 System-Übersicht
-
-| Komponente     | Details                                   |
-| -------------- | ----------------------------------------- |
-| Hardware       | Raspberry Pi 4B ("RpPi4B-002")            |
-| OS             | Raspberry Pi OS (Trixie, aarch64, 64-bit) |
-| Python         | 3.13                                      |
-| BirdNET-Modell | BirdNET_GLOBAL_6K_V2.4_Model_FP16         |
-| Webserver      | Caddy                                     |
-| Streaming      | Icecast2                                  |
-| PHP            | 8.4-FPM                                   |
-| Zugang         | Raspberry Pi Connect (Remote Shell)       |
-| Standort       | Burgdorf BE (47.056640, 7.61539)          |
+Built as a "brain gym" project – keeping the mind sharp through electronics and code. 🧠💪
+by Paul and Claude, Anthropic 2026
 
 ---
 
-## 🌐 Zugriff auf das Dashboard
+## 🖥️ System-Übersicht
 
-| Zugang      | Adresse                                              |
-| ----------- | ---------------------------------------------------- |
-| Lokal (LAN) | `http://10.0.1.181`                                  |
-| Hostname    | `http://RpPi4B-002.local` (falls avahi funktioniert) |
+| Komponente     | Details                                  |
+| -------------- | ---------------------------------------- |
+| Hardware       | Raspberry Pi 4B                          |
+| Hostname       | RpPi4B-002                               |
+| OS             | Raspberry Pi OS (Bookworm)               |
+| IP (LAN)       | 10.0.1.181                               |
+| BirdNET-Modell | BirdNET_GLOBAL_6K_V2.4_Model_FP16 (2023) |
+| Webserver      | Caddy                                    |
+| PHP            | PHP 8.4-FPM                              |
+| Datenbank      | SQLite3 (WAL-Modus)                      |
+
+---
+
+## 🔑 Zugangsdaten
+
+| Zugang                     | Details                                              |
+| -------------------------- | ---------------------------------------------------- |
+| Dashboard                  | `http://10.0.1.181`                                  |
+| SSH                        | `ssh paul-rppi@10.0.1.181`                           |
+| Advanced Settings User     | `birdnet`                                            |
+| Advanced Settings Passwort | `xxxxxx`                                             |
+| Passwort in Config         | `~/BirdNET-Pi/birdnet.conf` → `CADDY_PWD=kauzohr4me` |
 
 ---
 
 ## 📂 Wichtige Verzeichnisse & Dateien
 
-| Pfad                        | Inhalt                              |
-| --------------------------- | ----------------------------------- |
-| `~/BirdNET-Pi/`             | Hauptverzeichnis (Repo)             |
-| `~/BirdNET-Pi/birdnet.conf` | Konfigurationsdatei                 |
-| `~/BirdNET-Pi/homepage/`    | Web-Interface (PHP)                 |
-| `~/BirdNET-Pi/scripts/`     | Alle Skripte                        |
-| `~/BirdNET-Pi/model/`       | KI-Modell & Labels                  |
-| `~/BirdNET-Pi/templates/`   | Service-Templates                   |
-| `~/BirdSongs/`              | Aufgenommene Audio-Dateien          |
-| `~/BirdSongs/Extracted/`    | Erkannte Vogelstimmen-Clips         |
-| `/etc/caddy/Caddyfile`      | Webserver-Konfiguration             |
-| `/birdnet.conf`             | Symlink → ~/BirdNET-Pi/birdnet.conf |
+| Pfad                            | Inhalt                                    |
+| ------------------------------- | ----------------------------------------- |
+| `~/BirdNET-Pi/`                 | Hauptverzeichnis                          |
+| `~/BirdNET-Pi/homepage/`        | Web-Frontend (PHP, JS, CSS)               |
+| `~/BirdNET-Pi/scripts/`         | Backend-Skripte, config.php, overview.php |
+| `~/BirdNET-Pi/scripts/birds.db` | SQLite-Datenbank (WAL-Modus!)             |
+| `~/BirdNET-Pi/birdnet.conf`     | Hauptkonfiguration                        |
+| `~/BirdNET-Pi/apprise.txt`      | Notification-Konfiguration                |
+| `~/BirdNET-Pi/body.txt`         | Notification-Body                         |
+| `~/BirdSongs/`                  | Aufnahmen (WAV-Dateien)                   |
+| `~/BirdSongs/StreamData/`       | Live-Analysedaten                         |
+| `/etc/caddy/Caddyfile`          | Webserver-Konfiguration                   |
+| `/etc/birdnet/birdnet.conf`     | Symlink → `~/BirdNET-Pi/birdnet.conf`     |
 
 ---
 
-## 🔧 Wichtige Befehle zur Bedienung
+## 🔗 Symlinks (heute erstellt)
 
-### 🟢 Services starten / stoppen / Status
+| Symlink                              | Ziel                          | Zweck                              |
+| ------------------------------------ | ----------------------------- | ---------------------------------- |
+| `~/BirdNET-Pi/homepage/scripts`      | `→ ../scripts`                | PHP findet common.php, birds.db    |
+| `~/BirdNET-Pi/homepage/overview.php` | `→ ../scripts/overview.php`   | Species-Grid API                   |
+| `/etc/birdnet/birdnet.conf`          | `→ ~/BirdNET-Pi/birdnet.conf` | Settings speichern                 |
+| `/root/BirdSongs`                    | `→ ~/BirdSongs`               | Analysis-Service findet StreamData |
+
+---
+
+## ⚙️ Services
+
+| Service             | Funktion                            |
+| ------------------- | ----------------------------------- |
+| `birdnet_recording` | Nimmt Audio auf (alle 15 Sek.)      |
+| `birdnet_analysis`  | Analysiert Aufnahmen mit BirdNET-KI |
+| `birdnet_stats`     | Streamlit Dashboard (Port 8501)     |
+| `birdnet_log`       | GoTTY Log-Viewer (Port 8080)        |
+| `caddy`             | Webserver                           |
+| `php8.4-fpm`        | PHP FastCGI                         |
+
+### Alle Services sind `enabled` → Autostart nach Stromausfall ✅
+
+---
+
+## 🔧 Bedienungsbefehle
+
+### Services verwalten
 
 ```bash
-# Status aller BirdNET-Dienste
-sudo systemctl status birdnet* --no-pager
+# Status aller BirdNET-Services
+sudo systemctl status birdnet_recording birdnet_analysis birdnet_stats birdnet_log --no-pager
 
 # Einzelnen Service neu starten
-sudo systemctl restart birdnet_recording
 sudo systemctl restart birdnet_analysis
-sudo systemctl restart birdnet_stats
-sudo systemctl restart birdnet_log
 
-# Alle BirdNET-Dienste stoppen
+# Alle stoppen/starten
 sudo systemctl stop birdnet_recording birdnet_analysis birdnet_stats birdnet_log
-
-# Alle BirdNET-Dienste starten
 sudo systemctl start birdnet_recording birdnet_analysis birdnet_stats birdnet_log
 
-# Webserver
-sudo systemctl restart caddy
-sudo systemctl restart php8.4-fpm
-sudo systemctl restart icecast2
+# Autostart prüfen
+sudo systemctl is-enabled birdnet_recording birdnet_analysis birdnet_stats birdnet_log
 ```
 
-### 📊 Logs & Diagnose
+### Logs anschauen
 
 ```bash
-# BirdNET-Analyse-Log live verfolgen
+# Live-Ticker der Analyse
 journalctl -u birdnet_analysis -f
 
-# Recording-Log
-journalctl -u birdnet_recording -f
+# Letzte 30 Zeilen
+journalctl -u birdnet_analysis --no-pager -n 30
 
-# Caddy-Fehler
-sudo journalctl -u caddy --no-pager -n 30
+# Caddy-Logs
+journalctl -u caddy --no-pager -n 20
 
-# PHP-FPM Fehler
-sudo tail -30 /var/log/php8.4-fpm.log
-
-# Allgemeine System-Logs
-journalctl --since "1 hour ago" --no-pager
+# PHP-FPM Logs
+sudo tail -20 /var/log/php8.4-fpm.log
 ```
 
-### 🎙️ Mikrofon testen
+### Mikrofon testen
 
 ```bash
-# Verfügbare Aufnahmegeräte anzeigen
-arecord -l
-
-# 5 Sekunden Testaufnahme
-arecord -d 5 -f S16_LE -r 48000 /tmp/test.wav
-
-# Testaufnahme abspielen (nur mit angeschlossenem Audio-Ausgang)
-aplay /tmp/test.wav
-
-# Aufnahme-Pegel live beobachten
-arecord -f S16_LE -r 48000 -d 10 -vv /dev/null
+# 5 Sekunden aufnehmen und abspielen
+arecord -d 5 -f S16_LE -r 48000 /tmp/test.wav && aplay /tmp/test.wav
 ```
 
-### ⚙️ Konfiguration ändern
+### Datenbank
 
 ```bash
-# Konfigdatei bearbeiten
+# Anzahl Erkennungen
+sqlite3 ~/BirdNET-Pi/scripts/birds.db "SELECT COUNT(*) FROM detections;"
+
+# Heutige Arten
+sqlite3 ~/BirdNET-Pi/scripts/birds.db "SELECT DISTINCT Com_Name FROM detections WHERE Date = date('now');"
+
+# Tabellen anzeigen
+sqlite3 ~/BirdNET-Pi/scripts/birds.db ".tables"
+
+# Journal-Modus prüfen (muss "wal" sein!)
+sqlite3 ~/BirdNET-Pi/scripts/birds.db "PRAGMA journal_mode;"
+```
+
+### Webserver
+
+```bash
+# Caddyfile bearbeiten
+sudo nano -lmi /etc/caddy/Caddyfile
+
+# Caddy neu laden (ohne Downtime)
+sudo systemctl reload caddy
+
+# Caddy-Status
+sudo systemctl status caddy --no-pager
+```
+
+### Konfiguration
+
+```bash
+# birdnet.conf bearbeiten
 nano -lmi ~/BirdNET-Pi/birdnet.conf
 
-# Nach Änderungen: Services neu starten
-sudo systemctl restart birdnet_recording birdnet_analysis
+# Wichtige Parameter anzeigen
+grep -E "CONFIDENCE|LATITUDE|LONGITUDE|CADDY_PWD" ~/BirdNET-Pi/birdnet.conf
 ```
 
-### 💾 Datenbank
-
-```bash
-# Datenbank neu erstellen (VORSICHT: löscht Erkennungen!)
-sudo bash ~/BirdNET-Pi/scripts/createdb.sh
-
-# Datenbank-Grösse prüfen
-ls -lh ~/BirdNET-Pi/scripts/birds.db 2>/dev/null || find ~/BirdNET-Pi -name "*.db" -exec ls -lh {} \;
-```
-
-### 🔄 System-Wartung
-
-```bash
-# System aktualisieren
-sudo apt update && sudo apt upgrade -y
-
-# Speicherplatz prüfen
-df -h
-
-# Alte Aufnahmen aufräumen (älter als 30 Tage)
-find ~/BirdSongs/Extracted -mtime +30 -delete
-
-# Raspberry Pi Temperatur prüfen
-vcgencmd measure_temp
-
-# Uptime & Last
-uptime
-
-# Neustart
-sudo reboot
-```
-
-### 🌐 Netzwerk
+### Netzwerk
 
 ```bash
 # IP-Adresse anzeigen
 hostname -I
 
-# Netzwerk-Status
-ip addr show
+# Erreichbarkeit testen (vom Mac)
+ping 10.0.1.181
 
-# Pi von aussen erreichbar? (auf anderem Gerät im LAN)
-ping RpPi4B-002.local
+# HTTP-Antwort prüfen
+curl -I http://localhost
 ```
 
----
-
-## 📝 Konfigurations-Parameter (birdnet.conf)
-
-| Parameter        | Aktueller Wert                    | Beschreibung                         |
-| ---------------- | --------------------------------- | ------------------------------------ |
-| LATITUDE         | 47.056640                         | Breitengrad Burgdorf                 |
-| LONGITUDE        | 7.61539                           | Längengrad Burgdorf                  |
-| CONFIDENCE       | 0.7                               | Min. Erkennungs-Sicherheit (0.0–1.0) |
-| SENSITIVITY      | 1.25                              | Mikrofon-Empfindlichkeit (0.5–1.5)   |
-| RECORDING_LENGTH | 15                                | Aufnahme-Chunks in Sekunden          |
-| DATABASE_LANG    | de                                | Artnamen auf Deutsch                 |
-| MODEL            | BirdNET_GLOBAL_6K_V2.4_Model_FP16 | KI-Modell                            |
-
-### Tipps zur Feinabstimmung:
-
-| Situation                | Anpassung                                             |
-| ------------------------ | ----------------------------------------------------- |
-| Zu viele Fehlerkennungen | CONFIDENCE erhöhen (z.B. 0.8)                         |
-| Zu wenige Erkennungen    | CONFIDENCE senken (z.B. 0.5) oder SENSITIVITY erhöhen |
-| Laute Umgebung (Strasse) | SENSITIVITY senken (z.B. 1.0)                         |
-| Leise Umgebung (Wald)    | SENSITIVITY erhöhen (z.B. 1.5)                        |
-
----
-
-## ⚡ Autostart nach Stromausfall
-
-Alle Services sind **enabled** – sie starten automatisch mit dem Pi:
+### Wartung
 
 ```bash
-# Prüfen ob Autostart aktiv
-sudo systemctl is-enabled birdnet_recording birdnet_analysis birdnet_stats birdnet_log
-# Erwartete Ausgabe: 4x "enabled"
+# Speicherplatz
+df -h
+
+# RAM-Auslastung
+free -h
+
+# CPU-Temperatur
+vcgencmd measure_temp
+
+# System updaten
+sudo apt update && sudo apt upgrade -y
 ```
 
 ---
 
-## 🛠️ Bekannte Workarounds (aus der Installation)
+## 🐛 Heute gelöste Probleme
 
-| Problem                        | Lösung                                                       |
-| ------------------------------ | ------------------------------------------------------------ |
-| dpkg hängt bei rpi-connect     | `nohup sudo dpkg --configure rpi-connect &` (killt Shell!)   |
-| Pfade unter /root fehlen       | Symlinks: `sudo ln -sf ~/BirdNET-Pi /root/BirdNET-Pi`        |
-| PHP "File not found"           | `chmod 755 /home/paul-rppi` + www-data zur Gruppe hinzufügen |
-| homepage findet scripts/ nicht | `ln -sf ~/BirdNET-Pi/scripts ~/BirdNET-Pi/homepage/scripts`  |
-| Caddy zeigt weisse Seite       | Caddyfile: `php_fastcgi` VOR `file_server` + `try_files` Direktive |
+### 1. Weisse Seite im Browser
+
+**Ursache:** `file_server browse` stand VOR `php_fastcgi` im Caddyfile
+**Fix:** Reihenfolge geändert – `php_fastcgi` zuerst
+
+### 2. "File not found" (PHP-FPM)
+
+**Ursache:** www-data hatte keinen Zugriff auf `/home/paul-rppi/`
+**Fix:** `chmod 755 /home/paul-rppi` + User zur Gruppe hinzugefügt
+
+### 3. require_once(scripts/common.php) Fatal Error
+
+**Ursache:** `homepage/scripts/` Ordner fehlte
+**Fix:** `ln -sf /home/paul-rppi/BirdNET-Pi/scripts /home/paul-rppi/BirdNET-Pi/homepage/scripts`
+
+### 4. FileNotFoundError: /root/BirdSongs/StreamData/analyzing_now.txt
+
+**Ursache:** Service läuft als root, sucht unter `/root/`
+**Fix:** `sudo ln -sf /home/paul-rppi/BirdSongs /root/BirdSongs` + `mkdir -p ~/BirdSongs/StreamData`
+
+### 5. "Species data unavailable" im Dashboard
+
+**Ursache:** `overview.php` fehlte im homepage-Ordner + "Database is busy"
+**Fix:**
+
+- `ln -sf /home/paul-rppi/BirdNET-Pi/scripts/overview.php /home/paul-rppi/BirdNET-Pi/homepage/overview.php`
+- `sudo sqlite3 ~/BirdNET-Pi/scripts/birds.db "PRAGMA journal_mode=WAL;"`
+
+### 6. "Database is busy"
+
+**Ursache:** SQLite im DELETE-Modus erlaubt kein gleichzeitiges Lesen+Schreiben
+**Fix:** WAL-Modus aktiviert (Service stoppen → WAL setzen → Service starten)
+
+### 7. Settings fwrite() Fatal Error
+
+**Ursache:** `/etc/birdnet/birdnet.conf` nicht beschreibbar + `apprise.txt`/`body.txt` fehlten
+**Fix:**
+
+```bash
+sudo mkdir -p /etc/birdnet
+sudo ln -sf /home/paul-rppi/BirdNET-Pi/birdnet.conf /etc/birdnet/birdnet.conf
+sudo touch ~/BirdNET-Pi/apprise.txt ~/BirdNET-Pi/body.txt
+sudo chown www-data:www-data ~/BirdNET-Pi/birdnet.conf ~/BirdNET-Pi/apprise.txt ~/BirdNET-Pi/body.txt
+sudo chmod 664 ~/BirdNET-Pi/birdnet.conf ~/BirdNET-Pi/apprise.txt ~/BirdNET-Pi/body.txt
+```
+
+### 8. Advanced Settings – Passwort ausgesperrt
+
+**Ursache:** Username war `birdnet` (nicht `birdnetpi`) + Hash stimmte nicht
+**Fix:** Hash neu generiert mit `caddy hash-password --plaintext "kauzohr4me"` und in Caddyfile eingesetzt
+
+---
+
+## 📊 Aktueller Stand (15. Juli 2026, ~12:00)
+
+| Metrik               | Wert                                                    |
+| -------------------- | ------------------------------------------------------- |
+| Erkennungen heute    | 150+                                                    |
+| Arten heute          | 13+                                                     |
+| Lifetime Erkennungen | 187+                                                    |
+| Lifetime Arten       | 15+                                                     |
+| Top-Art              | Mauersegler (66 Erkennungen)                            |
+| Neue Arten           | Hausrotschwanz, Flussuferläufer, Graureiher, Rabenkrähe |
+
+---
+
+## 🔧 Caddyfile (aktuell)
+
+```
+http:// {
+    root * /home/paul-rppi/BirdNET-Pi/homepage
+
+    encode gzip
+
+    try_files {path} {path}/ /index.php?{query}
+    php_fastcgi unix//run/php/php-fpm.sock
+
+    handle /By_Date/* {
+        file_server browse
+    }
+    handle /Charts/* {
+        file_server browse
+    }
+
+    reverse_proxy /stream localhost:8000
+    reverse_proxy /log* localhost:8080
+    reverse_proxy /stats* localhost:8501
+    reverse_proxy /terminal* localhost:8888
+
+    file_server
+}
+```
+
+---
+
+## 💡 Feinabstimmungs-Tipps
+
+| Parameter            | Aktuell   | Empfehlung                                   |
+| -------------------- | --------- | -------------------------------------------- |
+| Confidence Threshold | 0.7 (70%) | Gut zum Start; auf 0.5 senken für mehr Arten |
+| Species Occurrence   | 0.03      | Standard OK für Mitteleuropa                 |
+| Overlap              | 0.0       | Standard OK                                  |
+| Recording Length     | 15 Sek.   | Standard OK                                  |
+
+---
+
+## 🎙️ Mikrofon-Tipps (Draussen)
+
+- Windschutz (Schaumstoff/Fell) verwenden
+- Regengeschützt montieren (unter Dachvorsprung)
+- Weg von Strassen (Verkehrslärm vermirrt KI)
+- USB-Kabel max. 3–5m (aktiver USB-Hub bei längerem Kabel)
+- Richtung Garten/Bäume ausrichten
 
 ---
 
 ## 🔗 Ressourcen
 
-| Link                            | Beschreibung              |
-| ------------------------------- | ------------------------- |
-| https://github.com/birdnet-team | BirdNET Original-Team     |
-| https://synature.ai/de/         | synature.ai               |
-| https://github.com/Paul-3400    | Paul's GitHub-Profil      |
-| https://rpltd.co/rpi-connect    | Raspberry Pi Connect Doku |
+- BirdNET-Team: https://github.com/birdnet-team
+- Synature.ai: https://synature.ai/de/
+- Paul's GitHub: https://github.com/Paul-3400
 
 ---
 
-## 📅 Installations-Datum
+## 📝 Nächste Schritte
 
-**14. Juli 2026**
+- [ ] Advanced Settings durchgehen (Audio-Gain, Storage)
+- [ ] Confidence ggf. anpassen nach ersten Tagen
+- [ ] HANDOVER.md auf GitHub pushen
+- [ ] Checkpoint nach 1 Woche: Erkennungsrate bewerten
+- [ ] Optional: Notifications einrichten (Telegram/Email)
 
 ---
 
-## 🦉 Viel Freude mit deiner Vogelstation!
-
-> "Your station is still learning what a normal day sounds like here."  
-> – BirdNET-Pi Dashboard
-
-Die Station lauscht. Die Vögel singen. Das Gehirn bleibt fit. 🧠💪🎙️
+*Letzte Aktualisierung: 15. Juli 2026, ~12:00 Uhr*
