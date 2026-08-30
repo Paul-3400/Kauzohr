@@ -1,0 +1,714 @@
+// ============================================================
+// BirdNET Outdoor-Mikrofon – Firmware v1.1
+// ============================================================
+// Built as a "brain gym" project – keeping the mind sharp
+// through electronics and code.
+// by Paul and Claude (Anthropic Claude 4, 2026)
+//
+// Hardware:
+//   - Seeed XIAO ESP32-S3 (8MB PSRAM)
+//   - INMP441 I2S MEMS Mikrofon
+//   - Solar 5V/5W -> TP4056 -> 21700 Li-Ion 5000mAh -> XIAO BAT
+//   - Spannungsteiler 2x200k Ohm -> A3 (Batteriespannung)
+//
+// v1.1 Erweiterungen (gegenueber v1.0):
+//   - Batteriespannung messen (ADC, Spannungsteiler 2x200k Ohm)
+//   - Spannung als X-Battery-Voltage Header beim Upload senden
+//   - Remote-Konfiguration vom Pi abrufen (GET /config)
+//   - Alle Betriebsparameter dynamisch steuerbar via Dashboard
+//
+// Funktion:
+//   1. Wake up from Deep Sleep
+//   2. Batteriespannung messen (ADC an A3)
+//   3. WiFi verbinden
+//   4. Remote-Config vom Pi laden (/config)
+//   5. Prüfe Betriebszeit (konfigurierbar via Dashboard)
+//   6. Aufnahme -> PSRAM-Puffer
+//   7. Audio-Verarbeitung (Hochpass, Gain, Noise Gate)
+//   8. HTTP POST WAV an Pi (mit Batteriespannung im Header)
+//   9. Deep Sleep
+//
+// GitHub: https://github.com/Paul-3400
+// ============================================================
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <ArduinoJson.h>
+
+// ============================================================
+// FESTE KONFIGURATION (nicht remote aenderbar)
+// ============================================================
+
+// ----- NETZWERK -----
+#define WIFI_SSID           "MeinWLAN"
+#define WIFI_PASSWORD       "WLANPasswort"
+#define PI_SERVER_IP        "10.0.1.196"
+#define PI_SERVER_PORT      5000
+#define PI_ENDPOINT         "/upload"
+#define PI_CONFIG_ENDPOINT  "/config"
+
+// ----- NTP (Zeitserver) -----
+#define NTP_SERVER          "pool.ntp.org"
+#define NTP_GMT_OFFSET      3600        // UTC+1 (Winterzeit)
+#define NTP_DAYLIGHT_OFFSET 3600        // +1h Sommerzeit
+
+// ----- HARDWARE PINS -----
+#define I2S_SCK             GPIO_NUM_1  // D0 -> INMP441 SCK
+#define I2S_WS              GPIO_NUM_2  // D1 -> INMP441 WS
+#define I2S_SD              GPIO_NUM_3  // D2 -> INMP441 SD
+#define BATTERY_PIN         A3          // D3/GPIO4 -> Spannungsteiler Mittenabgriff
+
+// ----- AUDIO-FORMAT (fest) -----
+#define SAMPLE_RATE         48000
+#define SAMPLE_BITS         16
+#define CHANNELS            1
+
+// ----- SPANNUNGSMESSUNG -----
+// Spannungsteiler: BAT+ -> 200k Ohm -> Mittenabgriff (A3) -> 200k Ohm -> GND
+// Teilverhaeltnis: 200k / (200k + 200k) = 0.5
+// V_bat = V_adc x 2.0
+#define VOLTAGE_DIVIDER_RATIO  2.0
+#define ADC_RESOLUTION         4095.0   // 12-bit ADC
+#define ADC_REF_VOLTAGE        3.3      // ESP32-S3 ADC Referenz
+#define VOLTAGE_SAMPLES        32       // Mehrfachmessung fuer Stabilitaet
+
+// ============================================================
+// REMOTE-KONFIGURIERBARE PARAMETER (Defaults, via Dashboard aenderbar)
+// ============================================================
+
+// Diese Werte werden beim Start vom Pi geladen (GET /config)
+// Falls der Pi nicht erreichbar ist, gelten diese Fallback-Werte.
+
+int    cfg_active_hour_start   = 4;
+int    cfg_active_hour_end     = 22;
+int    cfg_record_duration_sec = 20;
+int    cfg_deep_sleep_sec      = 5;
+int    cfg_wifi_timeout_ms     = 10000;
+int    cfg_post_timeout_ms     = 5000;
+float  cfg_gain                = 2.0;
+int    cfg_noise_threshold     = 500;
+float  cfg_hp_filter_alpha     = 0.98;
+bool   cfg_use_noise_gate      = true;
+bool   cfg_use_hp_filter       = true;
+
+// ============================================================
+// BERECHNETE KONSTANTEN
+// ============================================================
+
+#define BYTES_PER_SAMPLE    (SAMPLE_BITS / 8)
+#define WAV_HEADER_SIZE     44
+
+// ============================================================
+// GLOBALE VARIABLEN
+// ============================================================
+
+int16_t* audioBuffer = NULL;
+bool timeValid = false;
+float batteryVoltage = 0.0;    // NEU: Gemessene Batteriespannung
+
+// Hochpassfilter Zustandsvariablen
+float hp_prev_in = 0.0;
+float hp_prev_out = 0.0;
+
+// Firmware-Version
+const char* FW_VERSION = "1.1";
+
+// ============================================================
+// BATTERIESPANNUNG MESSEN (NEU in v1.1)
+// ============================================================
+
+/**
+ * Batteriespannung ueber ADC mit Spannungsteiler messen
+ * 
+ * Schaltung:  BAT+ --- 200k Ohm --+-- 200k Ohm --- GND
+ *                                  |
+ *                                 A3 (ADC)
+ * 
+ * V_adc = V_bat x 0.5
+ * V_bat = V_adc x 2.0
+ * 
+ * Mehrfachmessung (32x) fuer stabilen Wert
+ */
+float readBatteryVoltage() {
+  long adcSum = 0;
+
+  for (int i = 0; i < VOLTAGE_SAMPLES; i++) {
+    adcSum += analogRead(BATTERY_PIN);
+    delayMicroseconds(100);
+  }
+
+  float adcAvg = (float)adcSum / VOLTAGE_SAMPLES;
+  float adcVoltage = (adcAvg / ADC_RESOLUTION) * ADC_REF_VOLTAGE;
+  float batVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+
+  Serial.printf("Batterie: ADC=%d (avg), V_adc=%.3fV, V_bat=%.3fV\n",
+                (int)adcAvg, adcVoltage, batVoltage);
+
+  return batVoltage;
+}
+
+// ============================================================
+// REMOTE-KONFIGURATION (NEU in v1.1)
+// ============================================================
+
+/**
+ * Konfiguration vom Pi laden (GET /config)
+ * Ueberschreibt die lokalen cfg_* Variablen
+ * Bei Fehler bleiben die Defaults/vorherigen Werte aktiv
+ */
+bool fetchConfigFromPi() {
+  HTTPClient http;
+  String url = String("http://") + PI_SERVER_IP + ":" + PI_SERVER_PORT + PI_CONFIG_ENDPOINT;
+
+  Serial.printf("Config laden: %s\n", url.c_str());
+
+  http.begin(url);
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.printf("Config-Abruf fehlgeschlagen: HTTP %d\n", httpCode);
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  // JSON parsen mit ArduinoJson
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    Serial.printf("Config JSON Parse-Fehler: %s\n", error.c_str());
+    return false;
+  }
+
+  // Werte uebernehmen (nur wenn vorhanden im JSON)
+  if (doc.containsKey("active_hour_start"))   cfg_active_hour_start   = doc["active_hour_start"].as<int>();
+  if (doc.containsKey("active_hour_end"))     cfg_active_hour_end     = doc["active_hour_end"].as<int>();
+  if (doc.containsKey("record_duration_sec")) cfg_record_duration_sec = doc["record_duration_sec"].as<int>();
+  if (doc.containsKey("deep_sleep_sec"))      cfg_deep_sleep_sec      = doc["deep_sleep_sec"].as<int>();
+  if (doc.containsKey("wifi_timeout_ms"))     cfg_wifi_timeout_ms     = doc["wifi_timeout_ms"].as<int>();
+  if (doc.containsKey("post_timeout_ms"))     cfg_post_timeout_ms     = doc["post_timeout_ms"].as<int>();
+  if (doc.containsKey("gain"))                cfg_gain                = doc["gain"].as<float>();
+  if (doc.containsKey("noise_threshold"))     cfg_noise_threshold     = doc["noise_threshold"].as<int>();
+  if (doc.containsKey("hp_filter_alpha"))     cfg_hp_filter_alpha     = doc["hp_filter_alpha"].as<float>();
+  if (doc.containsKey("use_noise_gate"))      cfg_use_noise_gate      = doc["use_noise_gate"].as<bool>();
+  if (doc.containsKey("use_hp_filter"))       cfg_use_hp_filter       = doc["use_hp_filter"].as<bool>();
+
+  Serial.println("Remote-Config geladen:");
+  Serial.printf("   Aktiv: %02d:00 - %02d:00\n", cfg_active_hour_start, cfg_active_hour_end);
+  Serial.printf("   Aufnahme: %ds, Sleep: %ds\n", cfg_record_duration_sec, cfg_deep_sleep_sec);
+  Serial.printf("   Gain: %.1f, Noise Gate: %d (%s), HP-Filter: %s\n",
+                cfg_gain, cfg_noise_threshold,
+                cfg_use_noise_gate ? "ein" : "aus",
+                cfg_use_hp_filter ? "ein" : "aus");
+
+  return true;
+}
+
+// ============================================================
+// AUDIO-VERARBEITUNG
+// ============================================================
+
+/**
+ * Digital Gain - Verstaerkung aller Samples
+ */
+void applyGain(int16_t* samples, int count, float gain) {
+  if (gain == 1.0) return;
+
+  for (int i = 0; i < count; i++) {
+    int32_t amplified = (int32_t)(samples[i] * gain);
+    if (amplified > 32767) amplified = 32767;
+    if (amplified < -32768) amplified = -32768;
+    samples[i] = (int16_t)amplified;
+  }
+}
+
+/**
+ * Hochpassfilter - entfernt tieffrequentes Rauschen
+ */
+void applyHighPass(int16_t* samples, int count, float alpha) {
+  for (int i = 0; i < count; i++) {
+    float input = (float)samples[i];
+    float output = alpha * (hp_prev_out + input - hp_prev_in);
+    hp_prev_in = input;
+    hp_prev_out = output;
+
+    int32_t result = (int32_t)output;
+    if (result > 32767) result = 32767;
+    if (result < -32768) result = -32768;
+    samples[i] = (int16_t)result;
+  }
+}
+
+/**
+ * Noise Gate - prueft ob Audio ueber Schwellwert liegt
+ */
+bool isAudioActive(int16_t* samples, int count) {
+  if (!cfg_use_noise_gate || cfg_noise_threshold == 0) return true;
+
+  int16_t peak = 0;
+  for (int i = 0; i < count; i += 10) {
+    int16_t val = abs(samples[i]);
+    if (val > peak) peak = val;
+  }
+
+  Serial.printf("   Noise Gate: Peak = %d, Threshold = %d -> %s\n",
+                peak, cfg_noise_threshold,
+                (peak > cfg_noise_threshold) ? "AKTIV" : "STILLE");
+
+  return (peak > cfg_noise_threshold);
+}
+
+// ============================================================
+// I2S MIKROFON
+// ============================================================
+
+bool setupI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("I2S Driver Install Fehler: %d\n", err);
+    return false;
+  }
+
+  err = i2s_set_pin(I2S_NUM_0, &pin_config);
+  if (err != ESP_OK) {
+    Serial.printf("I2S Pin Config Fehler: %d\n", err);
+    return false;
+  }
+
+  delay(300);
+  size_t bytes_read;
+  int16_t dummy[512];
+  i2s_read(I2S_NUM_0, dummy, sizeof(dummy), &bytes_read, portMAX_DELAY);
+
+  Serial.println("I2S Mikrofon bereit");
+  return true;
+}
+
+/**
+ * Audio aufnehmen in PSRAM-Puffer
+ * Nutzt cfg_record_duration_sec (remote konfigurierbar!)
+ */
+int recordAudio() {
+  int totalSamples = SAMPLE_RATE * cfg_record_duration_sec;
+  int bufferBytes = totalSamples * BYTES_PER_SAMPLE;
+
+  Serial.printf("Aufnahme: %d Sek @ %d Hz (%d Bytes)...\n",
+                cfg_record_duration_sec, SAMPLE_RATE, bufferBytes);
+
+  unsigned long startTime = millis();
+  size_t totalBytesRead = 0;
+
+  while ((int)totalBytesRead < bufferBytes) {
+    size_t bytes_read = 0;
+    size_t chunkSize = 4096;
+    if (bufferBytes - (int)totalBytesRead < (int)chunkSize) {
+      chunkSize = bufferBytes - totalBytesRead;
+    }
+
+    esp_err_t err = i2s_read(I2S_NUM_0,
+                              (uint8_t*)audioBuffer + totalBytesRead,
+                              chunkSize,
+                              &bytes_read,
+                              portMAX_DELAY);
+
+    if (err != ESP_OK) {
+      Serial.printf("I2S Read Fehler: %d\n", err);
+      break;
+    }
+    totalBytesRead += bytes_read;
+  }
+
+  unsigned long duration = millis() - startTime;
+  int samplesRead = totalBytesRead / BYTES_PER_SAMPLE;
+
+  Serial.printf("Aufnahme fertig: %d Samples, %d Bytes, %lu ms\n",
+                samplesRead, (int)totalBytesRead, duration);
+
+  return samplesRead;
+}
+
+// ============================================================
+// WAV-HEADER
+// ============================================================
+
+void createWavHeader(uint8_t* header, int dataSize) {
+  int fileSize = dataSize + WAV_HEADER_SIZE - 8;
+  int byteRate = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE;
+  int blockAlign = CHANNELS * BYTES_PER_SAMPLE;
+
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  header[4] = fileSize & 0xFF;
+  header[5] = (fileSize >> 8) & 0xFF;
+  header[6] = (fileSize >> 16) & 0xFF;
+  header[7] = (fileSize >> 24) & 0xFF;
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  header[20] = 1; header[21] = 0;
+  header[22] = CHANNELS; header[23] = 0;
+  header[24] = SAMPLE_RATE & 0xFF;
+  header[25] = (SAMPLE_RATE >> 8) & 0xFF;
+  header[26] = (SAMPLE_RATE >> 16) & 0xFF;
+  header[27] = (SAMPLE_RATE >> 24) & 0xFF;
+  header[28] = byteRate & 0xFF;
+  header[29] = (byteRate >> 8) & 0xFF;
+  header[30] = (byteRate >> 16) & 0xFF;
+  header[31] = (byteRate >> 24) & 0xFF;
+  header[32] = blockAlign; header[33] = 0;
+  header[34] = SAMPLE_BITS; header[35] = 0;
+
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  header[40] = dataSize & 0xFF;
+  header[41] = (dataSize >> 8) & 0xFF;
+  header[42] = (dataSize >> 16) & 0xFF;
+  header[43] = (dataSize >> 24) & 0xFF;
+}
+
+// ============================================================
+// WIFI & HTTP
+// ============================================================
+
+bool connectWiFi() {
+  Serial.printf("WiFi verbinde zu: %s\n", WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > (unsigned long)cfg_wifi_timeout_ms) {
+      Serial.println("WiFi Timeout!");
+      WiFi.disconnect();
+      return false;
+    }
+    delay(100);
+    Serial.print(".");
+  }
+
+  Serial.printf("\nWiFi verbunden! IP: %s, RSSI: %d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  return true;
+}
+
+void disconnectWiFi() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("WiFi getrennt");
+}
+
+/**
+ * Audio als WAV per HTTP POST an Pi senden
+ * NEU: X-Battery-Voltage Header mit Batteriespannung
+ */
+bool postAudioToPI(int16_t* samples, int sampleCount) {
+  int dataSize = sampleCount * BYTES_PER_SAMPLE;
+  int totalSize = WAV_HEADER_SIZE + dataSize;
+
+  Serial.printf("Sende WAV: %d Bytes an http://%s:%d%s\n",
+                totalSize, PI_SERVER_IP, PI_SERVER_PORT, PI_ENDPOINT);
+  Serial.printf("   Batteriespannung im Header: %.3fV\n", batteryVoltage);
+
+  uint8_t wavHeader[WAV_HEADER_SIZE];
+  createWavHeader(wavHeader, dataSize);
+
+  WiFiClient tcpClient;
+  if (!tcpClient.connect(PI_SERVER_IP, PI_SERVER_PORT)) {
+    Serial.println("TCP Verbindung fehlgeschlagen");
+    return false;
+  }
+
+  // HTTP POST Header senden (NEU: X-Battery-Voltage)
+  tcpClient.printf("POST %s HTTP/1.1\r\n", PI_ENDPOINT);
+  tcpClient.printf("Host: %s:%d\r\n", PI_SERVER_IP, PI_SERVER_PORT);
+  tcpClient.printf("Content-Type: audio/wav\r\n");
+  tcpClient.printf("Content-Length: %d\r\n", totalSize);
+  tcpClient.printf("X-Battery-Voltage: %.3f\r\n", batteryVoltage);
+  tcpClient.printf("Connection: close\r\n");
+  tcpClient.printf("\r\n");
+
+  // WAV-Header senden
+  tcpClient.write(wavHeader, WAV_HEADER_SIZE);
+
+  // Audio-Daten in Chunks senden
+  int bytesSent = 0;
+  int chunkSize = 4096;
+  uint8_t* dataPtr = (uint8_t*)samples;
+
+  while (bytesSent < dataSize) {
+    int remaining = dataSize - bytesSent;
+    int toSend = (remaining < chunkSize) ? remaining : chunkSize;
+    int sent = tcpClient.write(dataPtr + bytesSent, toSend);
+
+    if (sent <= 0) {
+      Serial.println("Sende-Fehler!");
+      tcpClient.stop();
+      return false;
+    }
+    bytesSent += sent;
+  }
+
+  // Antwort lesen
+  unsigned long timeout = millis();
+  while (tcpClient.connected() && !tcpClient.available()) {
+    if (millis() - timeout > (unsigned long)cfg_post_timeout_ms) {
+      Serial.println("Antwort-Timeout");
+      break;
+    }
+    delay(10);
+  }
+
+  if (tcpClient.available()) {
+    String response = tcpClient.readStringUntil('\n');
+    Serial.printf("Pi Antwort: %s\n", response.c_str());
+  }
+
+  tcpClient.stop();
+  Serial.printf("Upload fertig: %d Bytes gesendet\n", totalSize);
+  return true;
+}
+
+// ============================================================
+// ZEIT / NTP
+// ============================================================
+
+bool syncTime() {
+  configTime(NTP_GMT_OFFSET, NTP_DAYLIGHT_OFFSET, NTP_SERVER);
+
+  struct tm timeinfo;
+  int retries = 0;
+  while (!getLocalTime(&timeinfo) && retries < 10) {
+    delay(500);
+    retries++;
+  }
+
+  if (retries >= 10) {
+    Serial.println("NTP Sync fehlgeschlagen");
+    return false;
+  }
+
+  Serial.printf("Zeit: %02d:%02d:%02d\n",
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  timeValid = true;
+  return true;
+}
+
+int getCurrentHour() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return -1;
+  }
+  return timeinfo.tm_hour;
+}
+
+long secondsUntilActive() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return 3600;
+  }
+
+  int currentSec = timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec;
+  int targetSec = cfg_active_hour_start * 3600;
+
+  long diff = targetSec - currentSec;
+  if (diff <= 0) diff += 86400;
+
+  return diff;
+}
+
+// ============================================================
+// DEEP SLEEP
+// ============================================================
+
+void goToDeepSleep(long seconds) {
+  Serial.printf("Deep Sleep: %ld Sekunden\n", seconds);
+  Serial.flush();
+
+  i2s_driver_uninstall(I2S_NUM_0);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n================================================");
+  Serial.printf("  BirdNET Outdoor-Mikrofon v%s\n", FW_VERSION);
+  Serial.println("  Brain Gym Project");
+  Serial.println("================================================");
+  Serial.printf("  PSRAM: %.2f MB\n", ESP.getPsramSize() / 1048576.0);
+  Serial.printf("  Free Heap: %d Bytes\n", ESP.getFreeHeap());
+  Serial.println("================================================\n");
+
+  // --- ADC fuer Batteriemessung konfigurieren ---
+  analogReadResolution(12);         // 12-bit (0-4095)
+  analogSetAttenuation(ADC_11db);   // Messbereich 0-3.3V
+
+  // --- Batteriespannung messen (vor WiFi, weniger Stoerungen) ---
+  batteryVoltage = readBatteryVoltage();
+
+  // --- PSRAM Audio-Puffer allozieren ---
+  // Max. Puffer fuer bis zu 30s Aufnahme (remote konfigurierbar)
+  int maxBufferBytes = SAMPLE_RATE * 30 * BYTES_PER_SAMPLE;  // 30s max
+  audioBuffer = (int16_t*)ps_malloc(maxBufferBytes);
+  if (audioBuffer == NULL) {
+    Serial.println("FATAL: PSRAM Allokation fehlgeschlagen!");
+    Serial.printf("   Benoetigt: %d Bytes\n", maxBufferBytes);
+    goToDeepSleep(60);
+    return;
+  }
+  Serial.printf("PSRAM Puffer: %d Bytes alloziert (max 30s)\n", maxBufferBytes);
+
+  // --- WiFi verbinden ---
+  if (!connectWiFi()) {
+    Serial.println("Kein WiFi - schlafe und versuche erneut");
+    goToDeepSleep(cfg_deep_sleep_sec);
+    return;
+  }
+
+  // --- NEU: Remote-Config vom Pi laden ---
+  bool configLoaded = fetchConfigFromPi();
+  if (configLoaded) {
+    Serial.println("Remote-Config aktiv");
+  } else {
+    Serial.println("Fallback: Lokale Defaults aktiv");
+  }
+
+  // --- Aktive Config anzeigen ---
+  Serial.println("\n--- Aktive Konfiguration ---");
+  Serial.printf("   Aktiv: %02d:00 - %02d:00 Uhr\n",
+                cfg_active_hour_start, cfg_active_hour_end);
+  Serial.printf("   Aufnahme: %ds, Sleep: %ds\n",
+                cfg_record_duration_sec, cfg_deep_sleep_sec);
+  Serial.printf("   Gain: %.1f, Noise Gate: %d (%s), HP: %s\n",
+                cfg_gain, cfg_noise_threshold,
+                cfg_use_noise_gate ? "ein" : "aus",
+                cfg_use_hp_filter ? "ein" : "aus");
+  Serial.printf("   Batterie: %.3fV\n", batteryVoltage);
+  Serial.println("----------------------------\n");
+
+  // --- Zeit synchronisieren ---
+  syncTime();
+
+  // --- Pruefe Betriebszeit (mit remote-konfigurierbaren Zeiten!) ---
+  int hour = getCurrentHour();
+  if (hour >= 0 && (hour < cfg_active_hour_start || hour >= cfg_active_hour_end)) {
+    long sleepTime = secondsUntilActive();
+    Serial.printf("Ausserhalb Betriebszeit (%02d Uhr)\n", hour);
+    Serial.printf("   Schlafe bis %02d:00 Uhr (%ld Sek)\n",
+                  cfg_active_hour_start, sleepTime);
+    disconnectWiFi();
+    goToDeepSleep(sleepTime);
+    return;
+  }
+
+  Serial.printf("Innerhalb Betriebszeit (%02d Uhr) - starte Aufnahme\n", hour);
+
+  // --- WiFi trennen waehrend Aufnahme (weniger Rauschen) ---
+  disconnectWiFi();
+
+  // --- I2S Mikrofon initialisieren ---
+  if (!setupI2S()) {
+    Serial.println("I2S Setup fehlgeschlagen!");
+    goToDeepSleep(cfg_deep_sleep_sec);
+    return;
+  }
+
+  // --- Aufnahme starten ---
+  int samplesRecorded = recordAudio();
+
+  if (samplesRecorded == 0) {
+    Serial.println("Keine Samples aufgenommen!");
+    goToDeepSleep(cfg_deep_sleep_sec);
+    return;
+  }
+
+  // --- I2S beenden ---
+  i2s_driver_uninstall(I2S_NUM_0);
+
+  // --- Audio-Verarbeitung (mit remote-konfigurierbaren Werten!) ---
+  Serial.println("\nAudio-Verarbeitung...");
+
+  if (cfg_use_hp_filter) {
+    Serial.printf("   Hochpassfilter (alpha=%.2f)\n", cfg_hp_filter_alpha);
+    applyHighPass(audioBuffer, samplesRecorded, cfg_hp_filter_alpha);
+  }
+
+  if (cfg_gain != 1.0) {
+    Serial.printf("   Gain: %.1fx\n", cfg_gain);
+    applyGain(audioBuffer, samplesRecorded, cfg_gain);
+  }
+
+  // --- Noise Gate ---
+  if (!isAudioActive(audioBuffer, samplesRecorded)) {
+    Serial.println("Stille erkannt - ueberspringe Upload");
+    goToDeepSleep(cfg_deep_sleep_sec);
+    return;
+  }
+
+  // --- WiFi erneut verbinden fuer Upload ---
+  if (!connectWiFi()) {
+    Serial.println("WiFi fuer Upload fehlgeschlagen");
+    goToDeepSleep(cfg_deep_sleep_sec);
+    return;
+  }
+
+  // --- Audio an Pi senden (mit Batteriespannung!) ---
+  bool success = postAudioToPI(audioBuffer, samplesRecorded);
+
+  if (success) {
+    Serial.println("\nZyklus erfolgreich abgeschlossen!");
+  } else {
+    Serial.println("\nUpload fehlgeschlagen - naechster Versuch nach Sleep");
+  }
+
+  // --- Aufraeumen und schlafen ---
+  disconnectWiFi();
+  goToDeepSleep(cfg_deep_sleep_sec);
+}
+
+// ============================================================
+// LOOP - wird nie erreicht (Deep Sleep startet neu in setup)
+// ============================================================
+
+void loop() {
+  Serial.println("Loop erreicht - sollte nicht passieren!");
+  delay(1000);
+  goToDeepSleep(cfg_deep_sleep_sec);
+}

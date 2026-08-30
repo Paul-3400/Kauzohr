@@ -1,0 +1,23 @@
+; ============================================================
+; BirdNET Outdoor-Mikrofon - PlatformIO Configuration v1.1
+; ============================================================
+; by Paul and Claude (Anthropic Claude 4, 2026)
+;
+; Board: Seeed XIAO ESP32-S3 (8MB PSRAM)
+; Framework: Arduino
+; ============================================================
+
+[env:seeed_xiao_esp32s3]
+platform = espressif32
+board = seeed_xiao_esp32s3
+framework = arduino
+
+; PSRAM aktivieren (8MB OPI)
+board_build.arduino.memory_type = qio_opi
+
+; Serial Monitor
+monitor_speed = 115200
+
+; v1.1: ArduinoJson fuer Remote-Config Parsing
+lib_deps =
+    bblanchon/ArduinoJson@^7.0.0
